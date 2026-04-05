@@ -369,7 +369,8 @@ def root() -> HTMLResponse:
 
 
 @app.post("/reset")
-def reset_environment(request: ResetRequest) -> dict:
+def reset_environment(request: ResetRequest | None = None) -> dict:
+    request = request or ResetRequest()
     observation = _ENV.reset_for_demo(
         difficulty=request.difficulty,
         seed=request.seed,

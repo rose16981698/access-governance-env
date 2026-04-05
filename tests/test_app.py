@@ -14,6 +14,12 @@ from server.app import app
 def test_http_smoke_routes():
     client = TestClient(app)
 
+    empty_reset_response = client.post("/reset")
+    assert empty_reset_response.status_code == 200
+    empty_reset_payload = empty_reset_response.json()
+    assert empty_reset_payload["observation"]["difficulty"] == "medium"
+    assert empty_reset_payload["info"]["step_count"] == 0
+
     reset_response = client.post("/reset", json={"seed": 5})
     assert reset_response.status_code == 200
     reset_payload = reset_response.json()
