@@ -4,80 +4,88 @@ import argparse
 import json
 import os
 import re
-import sys
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Optional
 
 import requests
 from openai import OpenAI
+from openenv.core.env_client import LocalDockerProvider
 
 from access_governance_env.baseline import choose_baseline_action
 from access_governance_env.client import AccessGovernanceEnv
 from access_governance_env.models import AccessGovernanceAction, AccessGovernanceObservation
 
-
+IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME") or os.getenv("IMAGE_NAME")
+API_KEY = (
+    os.getenv("HF_TOKEN")
+    or os.getenv("API_KEY")
+    or os.getenv("OPENAI_API_KEY")
+    or ""
+)
+API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
+MODEL_NAME = os.getenv("MODEL_NAME") or "Qwen/Qwen2.5-72B-Instruct"
+TASK_NAME = os.getenv("ACCESS_GOVERNANCE_TASK") or os.getenv("TASK_NAME")
+BENCHMARK = os.getenv("ACCESS_GOVERNANCE_BENCHMARK", "access_governance_env")
+MAX_STEPS = 6
+TEMPERATURE = 0.0
+MAX_TOKENS = 120
+SUCCESS_SCORE_THRESHOLD = 0.1
+DEFAULT_SPACE_URL = "https://rosha98-access-governance-env.hf.space"
+LLM_TIMEOUT_S = 10
 DEFAULT_TASK_SEEDS = {
     "easy": 5,
     "medium": 13,
     "hard": 23,
 }
+DEFAULT_TASK_IDS = ("easy", "medium", "hard")
 
-SYSTEM_PROMPT = """You are an enterprise access governance agent operating inside a deterministic OpenEnv task.
+SYSTEM_PROMPT = """You are reviewing an access-governance episode.
 
-You are given a candidate action chosen by the controller. Your job is to validate it and explain it briefly.
+You will be given the current observation and a candidate action produced by a
+deterministic controller. Validate that action and return JSON with exactly two
+keys:
+{"action": "<action>", "reason": "<short explanation>"}
 
-Use this operating policy:
-- Prefer evidence gathering before making a final decision.
-- Prioritize missing lookups in this order when evidence is still sparse:
-  1. inspect_resource_metadata
-  2. inspect_requester_profile
-  3. inspect_business_context
-  4. inspect_access_history
-  5. inspect_policy_rules
-- Deny if the visible evidence shows any hard blocker such as separation-of-duties conflict, missing or denied manager approval, missing training for high/critical access, or restricted contractor elevated access.
-- Escalate if the visible evidence shows emergency access, risky prior access history, a review-exception case, or critical access for a new employee.
-- Approve only when the visible evidence supports a clean auto-approval path.
-
-Respond with JSON only, with exactly these keys:
-{"action": "<repeat the candidate action>", "reason": "<short explanation>"}
+Rules:
+- The action must be one of the available actions.
+- Prefer evidence gathering before a terminal decision.
+- Use the candidate action unless the visible evidence clearly supports a better
+  alternative.
+- Keep the reason short.
 """
 
 
-def _stdout_event(tag: str, payload: dict[str, Any]) -> None:
-    print(f"{tag} {json.dumps(payload, separators=(',', ':'), ensure_ascii=False)}")
-    sys.stdout.flush()
-
-
-def _required_env(name: str) -> str:
-    value = os.environ.get(name, "").strip()
-    if not value:
-        raise RuntimeError(f"Missing required environment variable: {name}")
-    return value
-
-
-def _build_llm_client() -> tuple[OpenAI, str, str]:
-    api_base_url = _required_env("API_BASE_URL")
-    model_name = _required_env("MODEL_NAME")
-    api_key = os.environ.get("HF_TOKEN", "").strip() or os.environ.get(
-        "OPENAI_API_KEY", ""
-    ).strip()
-    if not api_key:
+def _required_api_key() -> str:
+    if not API_KEY.strip():
         raise RuntimeError("Missing required environment variable: HF_TOKEN")
+    return API_KEY.strip()
 
-    client_kwargs: dict[str, Any] = {
-        "api_key": api_key,
-        "base_url": api_base_url,
-        "timeout": 60,
-    }
-    if "openrouter.ai" in api_base_url:
-        client_kwargs["default_headers"] = {
-            "HTTP-Referer": os.environ.get(
-                "APP_URL",
-                "https://huggingface.co/spaces/rosha98/access-governance-env",
-            ),
-            "X-Title": "access-governance-env",
-        }
 
-    return OpenAI(**client_kwargs), api_base_url, model_name
+def _flatten(value: str) -> str:
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def log_start(task: str, env: str, model: str) -> None:
+    print(f"[START] task={task} env={env} model={model}", flush=True)
+
+
+def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str]) -> None:
+    error_value = _flatten(error) if error else "null"
+    action_value = _flatten(action)
+    print(
+        f"[STEP] step={step} action={action_value} reward={reward:.2f} "
+        f"done={str(done).lower()} error={error_value}",
+        flush=True,
+    )
+
+
+def log_end(success: bool, steps: int, score: float, rewards: list[float]) -> None:
+    rewards_str = ",".join(f"{reward:.2f}" for reward in rewards)
+    print(
+        f"[END] success={str(success).lower()} steps={steps} "
+        f"score={score:.3f} rewards={rewards_str}",
+        flush=True,
+    )
 
 
 def _extract_json_blob(text: str) -> dict[str, Any] | None:
@@ -86,13 +94,13 @@ def _extract_json_blob(text: str) -> dict[str, Any] | None:
         return None
 
     candidates = [text]
-    fenced_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-    if fenced_match:
-        candidates.insert(0, fenced_match.group(1))
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if fenced:
+        candidates.insert(0, fenced.group(1))
 
-    brace_match = re.search(r"\{.*\}", text, re.DOTALL)
-    if brace_match:
-        candidates.append(brace_match.group(0))
+    braces = re.search(r"\{.*\}", text, re.DOTALL)
+    if braces:
+        candidates.append(braces.group(0))
 
     for candidate in candidates:
         try:
@@ -104,193 +112,200 @@ def _extract_json_blob(text: str) -> dict[str, Any] | None:
     return None
 
 
-def _choose_action_with_llm(
-    *,
-    client: OpenAI,
-    model_name: str,
+def _build_user_prompt(
     observation: AccessGovernanceObservation,
-    fallback_action: str,
-) -> tuple[str, str, str, str]:
-    user_payload = {
+    candidate_action: str,
+) -> str:
+    payload = {
         "request_id": observation.request_id,
         "request_summary": observation.request_summary,
         "difficulty": observation.difficulty,
+        "revealed_evidence": observation.revealed_evidence,
         "last_result": observation.last_result,
         "remaining_steps": observation.remaining_steps,
         "available_actions": observation.available_actions,
-        "revealed_evidence": observation.revealed_evidence,
-        "candidate_action": fallback_action,
+        "candidate_action": candidate_action,
     }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def choose_action(
+    client: OpenAI,
+    observation: AccessGovernanceObservation,
+) -> str:
+    fallback_action = choose_baseline_action(observation).kind
 
     try:
-        response = client.chat.completions.create(
-            model=model_name,
-            temperature=0,
-            max_tokens=120,
+        completion = client.chat.completions.create(
+            model=MODEL_NAME,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+                {
+                    "role": "user",
+                    "content": _build_user_prompt(
+                        observation=observation,
+                        candidate_action=fallback_action,
+                    ),
+                },
             ],
+            temperature=TEMPERATURE,
+            max_tokens=MAX_TOKENS,
+            stream=False,
         )
-        content = response.choices[0].message.content or ""
-    except Exception as exc:
-        return (
-            fallback_action,
-            fallback_action,
-            f"fallback_llm_error:{type(exc).__name__}",
-            str(exc),
-        )
+    except Exception:
+        return fallback_action
 
+    content = completion.choices[0].message.content or ""
     parsed = _extract_json_blob(content) or {}
-    model_action = str(parsed.get("action", "")).strip() or fallback_action
-    reason = str(parsed.get("reason", "")).strip() or "model_reason_missing"
-    return fallback_action, model_action, reason, content
+    proposed_action = str(parsed.get("action", "")).strip()
+    if proposed_action in observation.available_actions:
+        return proposed_action
+    return fallback_action
 
 
-def _grader_score(env_base_url: str) -> dict[str, Any]:
-    response = requests.get(f"{env_base_url.rstrip('/')}/grader", timeout=30)
-    response.raise_for_status()
-    return response.json()
-
-
-def _task_ids(env_base_url: str) -> list[str]:
-    response = requests.get(f"{env_base_url.rstrip('/')}/tasks", timeout=30)
+def _grader_score(base_url: str) -> float:
+    response = requests.get(f"{base_url.rstrip('/')}/grader", timeout=30)
     response.raise_for_status()
     payload = response.json()
-    task_entries = payload.get("tasks", [])
-    return [entry["id"] for entry in task_entries if "id" in entry]
+    score = payload.get("score")
+    return float(score or 0.0)
+
+
+@dataclass
+class ManagedEnv:
+    env: AccessGovernanceEnv
+    provider: LocalDockerProvider | None = None
+
+    def close(self) -> None:
+        self.env.close()
+        if self.provider is not None:
+            self.provider.stop_container()
+
+
+def _create_env(base_url_arg: str | None) -> ManagedEnv:
+    base_url = (
+        (base_url_arg or "").strip()
+        or os.getenv("ENV_BASE_URL", "").strip()
+        or os.getenv("OPENENV_BASE_URL", "").strip()
+    )
+    if base_url:
+        return ManagedEnv(env=AccessGovernanceEnv(base_url=base_url))
+
+    if IMAGE_NAME:
+        provider = LocalDockerProvider()
+        runtime_url = provider.start_container(IMAGE_NAME)
+        provider.wait_for_ready(runtime_url)
+        return ManagedEnv(env=AccessGovernanceEnv(base_url=runtime_url), provider=provider)
+
+    return ManagedEnv(env=AccessGovernanceEnv(base_url=DEFAULT_SPACE_URL))
 
 
 def run_episode(
     *,
-    env: AccessGovernanceEnv,
-    llm_client: OpenAI,
-    model_name: str,
-    env_base_url: str,
+    client: OpenAI,
+    env_target: str | None,
     task_id: str,
+    benchmark: str,
     seed: int,
 ) -> float:
-    step_index = 0
-    reset_result = env.reset(difficulty=task_id, seed=seed)
-    observation = reset_result.observation
+    rewards: list[float] = []
+    steps_taken = 0
+    score = 0.0
+    success = False
+    managed_env: ManagedEnv | None = None
 
-    _stdout_event(
-        "[STEP]",
-        {
-            "phase": "task_start",
-            "task_id": task_id,
-            "seed": seed,
-            "request_id": observation.request_id,
-            "difficulty": observation.difficulty,
-        },
-    )
+    log_start(task=task_id, env=benchmark, model=MODEL_NAME)
 
-    while not observation.done:
-        step_index += 1
-        fallback_action = choose_baseline_action(observation).kind
-        action_kind, model_action, reason, raw_model_output = _choose_action_with_llm(
-            client=llm_client,
-            model_name=model_name,
-            observation=observation,
-            fallback_action=fallback_action,
-        )
+    try:
+        managed_env = _create_env(env_target)
+        result = managed_env.env.reset(difficulty=task_id, seed=seed)
+        observation = result.observation
 
-        step_result = env.step(AccessGovernanceAction(kind=action_kind))
-        observation = step_result.observation
+        for step in range(1, MAX_STEPS + 1):
+            if result.done:
+                break
 
-        _stdout_event(
-            "[STEP]",
-            {
-                "phase": "action",
-                "task_id": task_id,
-                "seed": seed,
-                "step_index": step_index,
-                "action": action_kind,
-                "model_action": model_action,
-                "reason": reason,
-                "fallback_action": fallback_action,
-                "reward": observation.reward,
-                "done": observation.done,
-                "last_result": observation.last_result,
-                "remaining_steps": observation.remaining_steps,
-                "raw_model_output": raw_model_output,
-            },
-        )
+            action = choose_action(client=client, observation=observation)
 
-    grader = _grader_score(env_base_url)
-    score = float(grader.get("score") or 0.0)
-    _stdout_event(
-        "[STEP]",
-        {
-            "phase": "task_end",
-            "task_id": task_id,
-            "seed": seed,
-            "score": score,
-            "done": grader.get("done"),
-            "score_breakdown": grader.get("score_breakdown"),
-        },
-    )
-    return score
+            try:
+                result = managed_env.env.step(AccessGovernanceAction(kind=action))
+                observation = result.observation
+                reward = float(result.reward or 0.0)
+                done = bool(result.done)
+                error = None
+            except Exception as exc:
+                reward = 0.0
+                done = True
+                error = str(exc)
+
+            rewards.append(reward)
+            steps_taken = step
+            log_step(
+                step=step,
+                action=action,
+                reward=reward,
+                done=done,
+                error=error,
+            )
+
+            if error:
+                break
+            if done:
+                break
+
+        try:
+            score = _grader_score(managed_env.env.base_url)
+        except requests.RequestException:
+            score = rewards[-1] if rewards else 0.0
+        score = max(0.0, min(score, 1.0))
+        success = score >= SUCCESS_SCORE_THRESHOLD
+        return score
+    except Exception:
+        return score
+    finally:
+        if managed_env is not None:
+            managed_env.close()
+        log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description=(
-            "Run dashboard-compatible inference against the Access Governance "
-            "environment."
-        )
+        description="Run dashboard-compatible inference for the Access Governance environment."
     )
     parser.add_argument(
         "--env-base-url",
         "--base-url",
         dest="env_base_url",
-        default=(
-            os.environ.get("ENV_BASE_URL")
-            or os.environ.get("OPENENV_BASE_URL")
-            or "http://localhost:8000"
-        ),
-        help="Environment base URL.",
+        default=None,
+        help="HTTP base URL for a running environment.",
     )
     args = parser.parse_args()
 
-    llm_client, api_base_url, model_name = _build_llm_client()
-    env_base_url = args.env_base_url.rstrip("/")
-    task_ids = _task_ids(env_base_url)
-    if not task_ids:
-        raise RuntimeError("No tasks were returned by /tasks")
+    client_kwargs: dict[str, Any] = {
+        "base_url": API_BASE_URL,
+        "api_key": _required_api_key(),
+        "timeout": LLM_TIMEOUT_S,
+        "max_retries": 0,
+    }
+    if "openrouter.ai" in API_BASE_URL:
+        client_kwargs["default_headers"] = {
+            "HTTP-Referer": DEFAULT_SPACE_URL,
+            "X-Title": "access-governance-env",
+        }
+    client = OpenAI(**client_kwargs)
+    env_target = args.env_base_url
+    task_ids = [TASK_NAME] if TASK_NAME else list(DEFAULT_TASK_IDS)
+    benchmark = BENCHMARK
 
-    _stdout_event(
-        "[START]",
-        {
-            "env_base_url": env_base_url,
-            "api_base_url": api_base_url,
-            "model_name": model_name,
-            "tasks": task_ids,
-        },
-    )
-
-    scores: dict[str, float] = {}
-    with AccessGovernanceEnv(base_url=env_base_url) as env:
-        for task_id in task_ids:
-            seed = DEFAULT_TASK_SEEDS.get(task_id, 0)
-            scores[task_id] = run_episode(
-                env=env,
-                llm_client=llm_client,
-                model_name=model_name,
-                env_base_url=env_base_url,
-                task_id=task_id,
-                seed=seed,
-            )
-
-    average_score = round(sum(scores.values()) / len(scores), 4)
-    _stdout_event(
-        "[END]",
-        {
-            "scores": scores,
-            "average_score": average_score,
-            "task_count": len(scores),
-        },
-    )
+    for task_id in task_ids:
+        seed = DEFAULT_TASK_SEEDS.get(task_id, 0)
+        run_episode(
+            client=client,
+            env_target=env_target,
+            task_id=task_id,
+            benchmark=benchmark,
+            seed=seed,
+        )
 
 
 if __name__ == "__main__":

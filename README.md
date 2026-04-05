@@ -281,21 +281,44 @@ These are baseline reference scores, not target requirements.
 
 ## Inference Script
 
-The repo includes a submission-facing `inference.py` that runs a deterministic
-heuristic agent against the HTTP environment. This satisfies the bootcamp
-requirement that the environment be paired with a working inference bridge,
-without requiring an OpenAI API key.
+The repo includes a submission-facing `inference.py` that follows the hackathon
+runner contract:
+
+- uses the OpenAI Python client for model calls
+- reads `API_BASE_URL`, `MODEL_NAME`, and `HF_TOKEN`
+- emits only `[START]`, `[STEP]`, and `[END]` lines to stdout
+- runs the three benchmark tasks by default: `easy`, `medium`, and `hard`
+
+Defaults:
+
+```bash
+API_BASE_URL=https://router.huggingface.co/v1
+MODEL_NAME=Qwen/Qwen2.5-72B-Instruct
+```
+
+Required:
+
+```bash
+HF_TOKEN=<your Hugging Face or compatible API key>
+```
 
 Run it against a local server:
 
 ```bash
-python inference.py
+python inference.py --base-url http://localhost:8000
 ```
 
 Run it against a deployed Space:
 
 ```bash
 python inference.py --base-url https://your-space-url.hf.space
+```
+
+Run it against a local Docker image by setting `LOCAL_IMAGE_NAME` and omitting
+`--base-url`:
+
+```bash
+LOCAL_IMAGE_NAME=access-governance-env python inference.py
 ```
 
 ## Local Development
