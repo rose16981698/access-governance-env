@@ -15,15 +15,10 @@ from access_governance_env.baseline import choose_baseline_action
 from access_governance_env.client import AccessGovernanceEnv
 from access_governance_env.models import AccessGovernanceAction, AccessGovernanceObservation
 
-IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME") or os.getenv("IMAGE_NAME")
-API_KEY = (
-    os.getenv("HF_TOKEN")
-    or os.getenv("API_KEY")
-    or os.getenv("OPENAI_API_KEY")
-    or ""
-)
-API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
-MODEL_NAME = os.getenv("MODEL_NAME") or "Qwen/Qwen2.5-72B-Instruct"
+LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME")
+HF_TOKEN = os.getenv("HF_TOKEN")
+API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
+MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
 TASK_NAME = os.getenv("ACCESS_GOVERNANCE_TASK") or os.getenv("TASK_NAME")
 BENCHMARK = os.getenv("ACCESS_GOVERNANCE_BENCHMARK", "access_governance_env")
 MAX_STEPS = 6
@@ -56,9 +51,9 @@ Rules:
 
 
 def _required_api_key() -> str:
-    if not API_KEY.strip():
+    if not HF_TOKEN or not HF_TOKEN.strip():
         raise RuntimeError("Missing required environment variable: HF_TOKEN")
-    return API_KEY.strip()
+    return HF_TOKEN.strip()
 
 
 def _flatten(value: str) -> str:
@@ -191,9 +186,9 @@ def _create_env(base_url_arg: str | None) -> ManagedEnv:
     if base_url:
         return ManagedEnv(env=AccessGovernanceEnv(base_url=base_url))
 
-    if IMAGE_NAME:
+    if LOCAL_IMAGE_NAME:
         provider = LocalDockerProvider()
-        runtime_url = provider.start_container(IMAGE_NAME)
+        runtime_url = provider.start_container(LOCAL_IMAGE_NAME)
         provider.wait_for_ready(runtime_url)
         return ManagedEnv(env=AccessGovernanceEnv(base_url=runtime_url), provider=provider)
 
