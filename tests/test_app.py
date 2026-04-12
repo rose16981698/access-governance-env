@@ -62,7 +62,7 @@ def test_http_smoke_routes():
     assert baseline_response.status_code == 200
     baseline_payload = baseline_response.json()
     assert set(baseline_payload) == {"easy", "medium", "hard"}
-    assert all(0.0 <= score <= 1.0 for score in baseline_payload.values())
+    assert all(0.0 < score < 1.0 for score in baseline_payload.values())
 
     grader_response = client.get("/grader")
     assert grader_response.status_code == 200
@@ -108,7 +108,7 @@ def test_web_and_baseline_smoke():
     session, _, _, _, score = run_baseline_demo(session, "medium", "7")
 
     assert session is not None
-    assert score["final_reward"] >= 0.0
+    assert 0.0 < score["final_reward"] < 1.0
     assert score["gold_decision"] in {"approve", "escalate", "deny"}
 
 

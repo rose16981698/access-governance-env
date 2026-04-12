@@ -25,6 +25,7 @@ from .policy import (
     difficulty_from_required_evidence,
     evaluate_case,
     score_decision,
+    timeout_breakdown,
 )
 
 
@@ -152,10 +153,16 @@ class AccessGovernanceEnvironment(
             if self._state.step_count >= self.max_steps:
                 self._terminated = True
                 self._state.terminal_reason = "step_budget_exhausted"
+                breakdown = timeout_breakdown(
+                    outcome=self._evaluation,
+                    seen_evidence=set(self._revealed_evidence),
+                    actual_lookups=self._lookup_count,
+                )
                 self._last_observation = self._build_observation(
                     last_result="step_budget_exhausted",
-                    reward=0.0,
+                    reward=float(breakdown["final_reward"]),
                     done=True,
+                    score_breakdown=breakdown,
                 )
                 return self._last_observation
 

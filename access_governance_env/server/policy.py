@@ -52,6 +52,8 @@ PUBLIC_POLICY_RULES = {
         "Deny if the request is outside the auto-approve matrix and outside the closed review-eligible exception set.",
     ],
 }
+MIN_FINAL_REWARD = 0.01
+MAX_FINAL_REWARD = 0.99
 
 
 @dataclass(frozen=True)
@@ -272,10 +274,13 @@ def score_decision(
 
     if not decision_match:
         base_reward = 0.0
-        final_reward = 0.0
+        final_reward = MIN_FINAL_REWARD
     else:
         base_reward = 1.0 if evidence_covered else 0.7
-        final_reward = max(0.0, min(1.0, round(base_reward - extra_lookup_penalty, 2)))
+        final_reward = max(
+            MIN_FINAL_REWARD,
+            min(MAX_FINAL_REWARD, round(base_reward - extra_lookup_penalty, 2)),
+        )
 
     return {
         "gold_decision": outcome.gold_decision,
@@ -290,4 +295,30 @@ def score_decision(
         "base_reward": base_reward,
         "final_reward": final_reward,
         "decision_reason": outcome.decision_reason,
+    }
+
+
+def timeout_breakdown(
+    *,
+    outcome: PolicyEvaluation,
+    seen_evidence: set[str],
+    actual_lookups: int,
+) -> dict[str, float | int | bool | list[str] | str | None]:
+    required_evidence = list(outcome.required_evidence)
+    seen = sorted(seen_evidence)
+    evidence_covered = set(outcome.required_evidence).issubset(seen_evidence)
+
+    return {
+        "gold_decision": outcome.gold_decision,
+        "agent_decision": None,
+        "decision_match": False,
+        "required_evidence": required_evidence,
+        "seen_evidence": seen,
+        "required_evidence_covered": evidence_covered,
+        "minimum_lookups": outcome.minimum_lookups,
+        "actual_lookups": actual_lookups,
+        "extra_lookup_penalty": 0.0,
+        "base_reward": 0.0,
+        "final_reward": MIN_FINAL_REWARD,
+        "decision_reason": "Episode timed out before a terminal decision was submitted.",
     }

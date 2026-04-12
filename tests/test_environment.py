@@ -50,7 +50,7 @@ def test_reward_full_evidence_minimal_lookups(make_case):
     observation = env.step(AccessGovernanceAction(kind="escalate"))
 
     assert observation.done is True
-    assert observation.reward == 1.0
+    assert observation.reward == 0.99
     assert observation.score_breakdown["required_evidence_covered"] is True
 
 
@@ -109,7 +109,7 @@ def test_wrong_decision_scores_zero(make_case):
     env.step(AccessGovernanceAction(kind="inspect_policy_rules"))
     observation = env.step(AccessGovernanceAction(kind="approve"))
 
-    assert observation.reward == 0.0
+    assert observation.reward == 0.01
     assert observation.score_breakdown["decision_match"] is False
 
 
@@ -122,7 +122,8 @@ def test_step_budget_exhaustion_on_lookup_step_six(make_case):
     observation = env.step(AccessGovernanceAction(kind="inspect_requester_profile"))
 
     assert observation.done is True
-    assert observation.reward == 0.0
+    assert observation.reward == 0.01
+    assert observation.score_breakdown["final_reward"] == 0.01
     assert env.state.terminal_reason == "step_budget_exhausted"
     assert env.state.final_decision is None
 
